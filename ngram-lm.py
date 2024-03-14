@@ -19,7 +19,6 @@ class LanguageModel:
     self.vocab = set()
     self.n_grams = {}
     self.n_minus_one_grams = {}
-    self.ngram_probability = {}
     self.train_tokens = 0
   
   def train(self, tokens: list, verbose: bool = False) -> None:
@@ -34,38 +33,35 @@ class LanguageModel:
     self.train_tokens = len(tokens)
     tokens_dict = dict(Counter(tokens))
     self.vocab = set(key for key in tokens_dict.keys() if tokens_dict[key] != 1)
-    # Add UNK to the vocab if there are tokens that occur only once
+
+    # Add UNK to the vocab if there are tokens that occur only once and replace train tokens
     if 1 in tokens_dict.values():
        self.vocab.add(UNK)
+    unk_tokens = [x for x in tokens_dict.keys() if tokens_dict[x] == 1]
+    tokens = [t if t not in unk_tokens else UNK for t in tokens]
 
     # Count ngrams, n - 1 grams 
-    unk_tokens = [x for x in tokens_dict.keys() if tokens_dict[x] == 1]
-    elements = self.__get_n_grams__(self.n_gram, tokens, unk_tokens)
+    elements = self.create_ngrams(tokens, self.n_gram)
     for elem in elements:
       key = tuple(elem)
       self.n_grams[key] = self.n_grams.get(key, 0) + 1    
     if self.n_gram > 1:
-      elements = self.__get_n_grams__(self.n_gram - 1, tokens, unk_tokens)
+      elements = self.create_ngrams(tokens, self.n_gram - 1)
       for elem in elements:
         key = tuple(elem)
-        self.n_minus_one_grams[key] = self.n_minus_one_grams.get(key, 0) + 1      
-    
-    # Calculate the probabilities of n-grams
-    for token in self.n_grams.keys():
-      self.ngram_probability[token] = self.__laplace_smoothing__(len(tokens), token)
+        self.n_minus_one_grams[key] = self.n_minus_one_grams.get(key, 0) + 1  
 
-  def __get_n_grams__(self, n: int, tokens: list, unk_tokens: list) -> list:
+  def create_ngrams(self, tokens: list, n: int) -> list:
     """Computes and returns the n grams from the given list of tokens, using the vocab.
     Args:
       n (int): the n-gram order of tokens 
       tokens (list): tokenized data to be trained on
-      unk_tokens (list): the unknown tokens
     Returns:
       list: the n-grams of order n
     """    
     ngrams = []
     for i in range(len(tokens) - n + 1):
-      ngram_tokens = [t if t not in unk_tokens else UNK for t in tokens[i : i + n]]
+      ngram_tokens = [t for t in tokens[i : i + n]]
       ngrams.append(ngram_tokens)
     return ngrams
 
@@ -94,14 +90,15 @@ class LanguageModel:
       float: the probability value of the given tokens for this model
     """
     probability_score = 1
+    # replace tokens with UNK if it's not in the vocab
     unk_tokens = [x for x in sentence_tokens if x not in self.vocab]
-    ngrams = self.__get_n_grams__(self.n_gram, sentence_tokens, unk_tokens)
+    tokens = [t if t not in unk_tokens else UNK for t in sentence_tokens]
+
+    # get ngrams and score 
+    ngrams = self.create_ngrams(tokens, self.n_gram)
     for elem in ngrams:
       key = tuple(elem)
-      if key in self.ngram_probability:
-        probability_score *= self.ngram_probability[key]
-      else:
-        probability_score *= self.__laplace_smoothing__(len(sentence_tokens), key)
+      probability_score *= self.__laplace_smoothing(key)
     return probability_score
 
   def generate_sentence(self) -> list:
@@ -110,32 +107,43 @@ class LanguageModel:
     Returns:
       list: the generated sentence as a list of tokens
     """
+    # set up start token context
     context = tuple(max(self.n_gram - 1, 1) * [SENTENCE_BEGIN])
     next_word = ""
     sentence = []
     i = self.n_gram
     sentence.extend(context)
-    while next_word is not SENTENCE_END:
-      next_word = self.__get_next_word__(tuple(context))
+
+    # generate until sentence end token is received
+    while next_word != SENTENCE_END:
+      next_word = self.__get_next_token(tuple(context))
       sentence.append(next_word)
       context = sentence[max(0, (i - self.n_gram) + 1): i]
       i += 1      
-    return [" ".join(token for token in sentence if token is not UNK)]
+    return [" ".join(sentence)]
   
-  def __get_next_word__(self, history: tuple) -> str:
+  def __get_next_token(self, history: tuple) -> str:
     """Returns the next word based on the given history. The next word is chosen randomly based on the ngram probability.
     Args:
       history (tuple): the n-1 context tokens
       
     Returns:
-      str: the next word for the given history
-    """
-    probabilities = {}
+      str: the next token for the given history
+    """ 
     if self.n_gram == 1:
-      probabilities = {key: self.ngram_probability[key] for key in self.ngram_probability.keys() if key != ('<s>',) }
+      total_counts = sum(self.n_grams.values())
+      # normalise the counts by the counts of the total ngrams for the context
+      normalised_counts = [ [ngram[-1], (count / total_counts)] for (ngram, count) in self.n_grams.items() ]
     else:
-      probabilities = {key: self.ngram_probability[key] for key in self.ngram_probability.keys() if key[0 : self.n_gram - 1] == history}
-    return random.choice(list(probabilities.keys()))[-1]
+      # get the possible ngrams for the given context 
+      filtered_counts = { key: value for key, value in self.n_grams.items() if key[:-1] == history }
+      if not filtered_counts:
+        return SENTENCE_END
+      # normalise the counts by the counts of the total ngrams for the context
+      total_counts = sum(filtered_counts.values())
+      normalised_counts = [ [ngram[-1], (count / total_counts)] for (ngram, count) in filtered_counts.items() ]
+    next_token = np.random.choice([ngram_count[0] for ngram_count in normalised_counts], p = [ngram_count[1] for ngram_count in normalised_counts])
+    return next_token
 
   def generate(self, n: int) -> list:
     """Generates n sentences from a trained language model using the Shannon technique.
@@ -259,14 +267,8 @@ if __name__ == '__main__':
     language_model.train(tokens)
 
     # Generate sentences
-    sentences = language_model.generate(20)
+    sentences = language_model.generate(10)
     for sentence in sentences:
         sentence = sentence[0].replace("<s> ", "")
         sentence = sentence.replace(" </s>", "")
         print(sentence)
-
-
-
-
-    
-
